@@ -1,39 +1,9 @@
 {
   "mcpServers": {
-    "my-vibe-mcp": {
-      "command": "C:\\Users\\HHI155113\\.local\\bin\\uv.exe",
-      "args": [
-        "run",
-        "--no-project",
-        "--quiet",
-        "C:\\Users\\HHI155113\\.gemini\\antigravity\\mcp_server.py"
-      ],
-      "env": {
-        "FASTMCP_LOG_LEVEL": "ERROR",
-        "PYTHONUTF8": "1"
-      }
-    },
-    "groq-speed-v4": {
-      "command": "C:\\Users\\HHI155113\\.local\\bin\\uv.exe",
-      "args": [
-        "run",
-        "--no-project",
-        "--quiet",
-        "C:\\Users\\HHI155113\\.gemini\\antigravity\\groq_mcp.py"
-      ],
-      "env": {
-        "FASTMCP_LOG_LEVEL": "ERROR",
-        "PYTHONUTF8": "1",
-        "GROQ_API_KEY": ""
-      }
-    },
     "neos-local-rag": {
-      "command": "C:\\Users\\HHI155113\\.local\\bin\\uv.exe",
+      "command": "C:\\Users\\HHI155113\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
       "args": [
-        "run",
-        "--no-project",
-        "--quiet",
-        "C:\\Users\\HHI155113\\.gemini\\antigravity\\local_rag_mcp.py"
+        "e:\\Project\\RAG_DB\\local_rag_mcp.py"
       ],
       "env": {
         "PYTHONUTF8": "1",
