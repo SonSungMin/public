@@ -28,8 +28,28 @@ from datetime import datetime
 # 🔒 중복 실행 방지를 위한 로컬 소켓 뮤텍스 락 (65432 포트 선점)
 _instance_socket = None
 
+def _kill_port_owner(port):
+    import subprocess
+    import os
+    try:
+        # netstat -ano 명령을 통해 포트 상태 검출
+        output = subprocess.check_output("netstat -ano", shell=True).decode('utf-8', errors='ignore')
+        for line in output.splitlines():
+            if f":{port}" in line and "LISTENING" in line:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    pid = parts[-1]
+                    # 현재 구동 중인 나 자신(os.getpid())이 아니라면 과감히 강제 소거 (데드락 방지)
+                    if int(pid) != os.getpid():
+                        subprocess.run(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
 def _ensure_single_instance():
     global _instance_socket
+    # 기동 직전, 8085 포트를 독점 점유하여 데드락 오작동을 유발하는 모든 유령(좀비) 프로세스를 안전 소거
+    _kill_port_owner(8085)
+    
     try:
         _instance_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         # 로컬 루프백의 65432 포트를 점유하여 글로벌 락으로 사용
@@ -66,16 +86,142 @@ PENDING_FILE = os.path.join(BASE_DIR, "pending_ingestion.json")
 REG_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 REG_VAL_NAME = "NeosLocalRAGDBManager"
 
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class EmbeddedRAGHandler(BaseHTTPRequestHandler):
+    engine = None
+    app_instance = None
+
+    def log_message(self, format, *args):
+        # FastMCP의 stdio 오염을 완벽히 배제하기 위해 stdout/stderr 출력을 배제하고, GUI 콘솔 로그에만 안전 적재
+        if EmbeddedRAGHandler.app_instance:
+            msg = format % args
+            EmbeddedRAGHandler.app_instance.root.after(
+                0, EmbeddedRAGHandler.app_instance.write_console_log, "API_SERVER", msg
+            )
+
+    def _send_response(self, status, content_type, data):
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+
+    def do_GET(self):
+        import urllib.parse
+        import json
+        try:
+            parsed_url = urllib.parse.urlparse(self.path)
+            
+            # 1. API: 하이브리드 RAG 검색
+            if parsed_url.path == '/api/search':
+                query_params = urllib.parse.parse_qs(parsed_url.query)
+                query = query_params.get('q', [''])[0]
+                limit = int(query_params.get('limit', [3])[0])
+                if not query:
+                    results = []
+                else:
+                    results = EmbeddedRAGHandler.engine.hybrid_search(query, top_k=limit)
+                
+                # GUI 실시간 모니터링 로그 기록 추가
+                if EmbeddedRAGHandler.app_instance:
+                    EmbeddedRAGHandler.app_instance.root.after(
+                        0, EmbeddedRAGHandler.app_instance.write_console_log, 
+                        "API_SEARCH", f"RAG 하이브리드 자동 검색 수행 완료 (쿼리: '{query[:40]}...', 결과: {len(results)}개)"
+                    )
+                
+                response_data = json.dumps(results, ensure_ascii=False)
+                self._send_response(200, 'application/json; charset=utf-8', response_data.encode('utf-8'))
+                return
+
+            self._send_response(404, 'text/plain', b'Not Found')
+        except Exception as e:
+            error_response = json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
+            self._send_response(500, 'application/json; charset=utf-8', error_response.encode('utf-8'))
+
+    def do_POST(self):
+        import urllib.parse
+        import json
+        parsed_url = urllib.parse.urlparse(self.path)
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length).decode('utf-8')
+        
+        try:
+            payload = json.loads(post_data)
+        except json.JSONDecodeError:
+            self._send_response(400, 'application/json', b'{"success": false, "error": "Invalid JSON"}')
+            return
+
+        try:
+            # 2. API: 신규 RAG 지식 추가
+            if parsed_url.path == '/api/add':
+                new_id = EmbeddedRAGHandler.engine.add_knowledge(
+                    category=payload['category'],
+                    issue_summary=payload['issue_summary'],
+                    root_cause=payload.get('root_cause', ''),
+                    solution_code=payload['solution_code'],
+                    tags=payload.get('tags', '')
+                )
+                self._send_response(200, 'application/json', json.dumps({"success": True, "id": new_id}).encode('utf-8'))
+                
+                # GUI 리프레시 동기화 호출
+                if EmbeddedRAGHandler.app_instance:
+                    EmbeddedRAGHandler.app_instance.root.after(0, EmbeddedRAGHandler.app_instance.manual_refresh)
+                    EmbeddedRAGHandler.app_instance.root.after(
+                        0, EmbeddedRAGHandler.app_instance.write_console_log, "API_ADD", f"지식 카드 신규 자동 갱신 완료 (ID: #{new_id})"
+                    )
+                    # 에이전트 대화 종료 및 RAG 데이터 갱신 시 백그라운드에서 rg.exe 프로세스 자동 완전 소거 가동
+                    threading.Thread(
+                        target=lambda: EmbeddedRAGHandler.app_instance.kill_rg_processes(show_msg=False),
+                        daemon=True
+                    ).start()
+                return
+
+            # 3. API: AI 토큰 누적 기록
+            if parsed_url.path == '/api/record_token':
+                model_name = payload['model_name']
+                input_tokens = int(payload['input_tokens'])
+                output_tokens = int(payload['output_tokens'])
+                EmbeddedRAGHandler.engine.record_token_usage(model_name, input_tokens, output_tokens)
+                self._send_response(200, 'application/json', b'{"success": true}')
+                
+                # GUI 토큰 모니터 패널 갱신
+                if EmbeddedRAGHandler.app_instance:
+                    EmbeddedRAGHandler.app_instance.root.after(0, EmbeddedRAGHandler.app_instance.refresh_token_usage)
+                    EmbeddedRAGHandler.app_instance.root.after(
+                        0, EmbeddedRAGHandler.app_instance.write_console_log, "API_TOKEN", f"토큰 자동 갱신 완료: {model_name} (in: {input_tokens}, out: {output_tokens})"
+                    )
+                    # 에이전트 대화 종료 및 RAG 데이터 갱신(또는 토큰 기록) 시 백그라운드에서 rg.exe 프로세스 자동 완전 소거 가동
+                    threading.Thread(
+                        target=lambda: EmbeddedRAGHandler.app_instance.kill_rg_processes(show_msg=False),
+                        daemon=True
+                    ).start()
+                return
+
+            self._send_response(404, 'text/plain', b'Not Found')
+        except Exception as e:
+            self._send_response(500, 'application/json', json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+
 class RAGManagerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("⚡ Neo's Local RAG DB Manager & Desktop Shell")
-        self.root.geometry("1180x800")
-        self.root.minsize(1000, 700)
         
         self.tray_icon = None
         self.is_watching_files = True
         self.file_watcher_thread = None
+
+        # 보조 모니터 자동 감지 및 너비 20% 확장 기하학(Geometry) 적용
+        self._apply_secondary_monitor_geometry()
 
         # 프리미엄 다크 테마 컬러 에스테틱 설정
         self.color_bg = "#0b0f19"         # 메인 다크 백그라운드
@@ -108,6 +254,10 @@ class RAGManagerApp:
         
         # 파일 기반 자가 학습 감시 루프 개시
         self.start_file_watcher()
+        self.start_embedded_api_server()
+        
+        # rg.exe 프로세스 개수 실시간 모니터링 타이머 개시
+        self.update_rg_count_loop()
         
         # 윈도우 시스템 트레이 지원 시 종료 이벤트 가로채기 재정의
         if TRAY_SUPPORTED:
@@ -118,8 +268,67 @@ class RAGManagerApp:
             self.root.protocol("WM_DELETE_WINDOW", self.close_application)
             self.write_console_log("SYSTEM", "경고: pystray/pillow 미설치로 일반 창 닫기 모드로 구동됩니다.")
 
-        # 메인 와이드 콘텐츠 좌우 3:7 비율 강제 싱크
-        self.root.after(150, self._force_sash_ratio)
+        # 메인 와이드 콘텐츠 좌우 3:7 비율 강제 싱크 제거 (정적 와이드 구조로 리팩토링)
+        pass
+
+    def _apply_secondary_monitor_geometry(self):
+        """보조 모니터를 정밀 탐색하여 창의 너비를 20% 늘린(1416x800) 상태로 우측 하단에 정밀 배치합니다.
+        한글 HHI 사내 폐쇄망 특성 상 외부 모니터 라이브러리(screeninfo 등) 부재 시를 대비해 Windows Win32 API를 사용합니다.
+        """
+        target_width = 1416
+        target_height = 800
+        self.root.minsize(1200, 700)
+        
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            
+            # 모니터 좌표들을 수집하기 위한 구조체 및 콜백 정의
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long),
+                            ("top", ctypes.c_long),
+                            ("right", ctypes.c_long),
+                            ("bottom", ctypes.c_long)]
+            
+            monitors = []
+            
+            def monitor_enum_proc(hMonitor, hdcMonitor, lprcMonitor, dwData):
+                rect = lprcMonitor.contents
+                monitors.append((rect.left, rect.top, rect.right, rect.bottom))
+                return True
+            
+            MONITORENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_ulong, ctypes.c_ulong, ctypes.POINTER(RECT), ctypes.c_double)
+            user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(monitor_enum_proc), 0)
+            
+            # 보조 모니터 선택 (2개 이상 시 index 1, 1개 시 주 모니터 index 0)
+            if len(monitors) >= 2:
+                # 보조 모니터 좌표 획득
+                m_left, m_top, m_right, m_bottom = monitors[1]
+            else:
+                m_left, m_top, m_right, m_bottom = monitors[0]
+            
+            # 작업표시줄 높이 및 마진을 고려한 우측 하단 배치 좌표 산출
+            # 우측 마진: 20px, 하단 마진: 60px (작업표시줄 고려)
+            x = m_right - target_width - 20
+            y = m_bottom - target_height - 60
+            
+            # 윈도우 좌표 한계 검사로 안전성 보장
+            if x < m_left:
+                x = m_left
+            if y < m_top:
+                y = m_top
+                
+            self.root.geometry(f"{target_width}x{target_height}+{x}+{y}")
+        except Exception as e:
+            # ctypes 호출 에러 시 기본 화면 기준 우측 하단 Fallback
+            try:
+                screen_width = self.root.winfo_screenwidth()
+                screen_height = self.root.winfo_screenheight()
+                x = screen_width - target_width - 20
+                y = screen_height - target_height - 60
+                self.root.geometry(f"{target_width}x{target_height}+{max(0, x)}+{max(0, y)}")
+            except Exception:
+                self.root.geometry("1416x800")
 
     def _setup_styles(self):
         """Ttk 컨트롤들을 위한 프리미엄 다크 테마 커스텀 스타일링"""
@@ -199,16 +408,17 @@ class RAGManagerApp:
                                   font=("Segoe UI", 9), bg=self.color_bg, fg=self.color_gray)
         subtitle_label.pack(side="left", padx=15, pady=9)
 
-        # 메인 와이드 컨텐트 팬 분할 (좌측 컨트롤러 / 우측 RAG 탐색 및 로그)
-        main_paned = ttk.Panedwindow(self.root, orient="horizontal")
-        main_paned.pack(fill="both", expand=True, padx=20, pady=5)
-        self.main_paned = main_paned
+        # 메인 와이드 콘텐츠 프레임 (좌우 배치 컨테이너)
+        main_frame = ttk.Frame(self.root, style="TFrame")
+        main_frame.pack(fill="both", expand=True, padx=20, pady=5)
+        self.main_frame = main_frame
 
         # ==========================================
         # [좌측 프레임] 지식 등록기 및 OS 설정 (380px 고정)
         # ==========================================
-        left_frame = ttk.Frame(main_paned, style="Panel.TFrame", padding=15)
-        main_paned.add(left_frame, weight=3)
+        left_frame = ttk.Frame(main_frame, style="Panel.TFrame", padding=15, width=380)
+        left_frame.pack(side="left", fill="both", padx=(0, 10))
+        left_frame.pack_propagate(False) # 380px 크기 강제 고정 (내부 위젯에 의해 절대 찌그러지지 않게 전격 보호)
 
         # 1구역: DB 현황 요약
         db_sec = tk.LabelFrame(left_frame, text=" RAG 데이터베이스 현황 ", 
@@ -235,7 +445,7 @@ class RAGManagerApp:
         btn_db_refresh.pack(side="left", fill="x", expand=True, padx=(2, 0))
 
         btn_action_frame = ttk.Frame(db_sec, style="Panel.TFrame")
-        btn_action_frame.pack(fill="x", padx=10, pady=(2, 5))
+        btn_action_frame.pack(fill="x", padx=10, pady=(2, 2))
 
         btn_db_restart = ttk.Button(btn_action_frame, text="⚡ 앱 재시작 (Restart)", 
                                     style="Accent.TButton", command=self.restart_application)
@@ -244,6 +454,14 @@ class RAGManagerApp:
         btn_db_exit = ttk.Button(btn_action_frame, text="🔴 완전 종료 (Exit)", 
                                  style="Stop.TButton", command=self.close_application)
         btn_db_exit.pack(side="left", fill="x", expand=True, padx=(2, 0))
+
+        # rg.exe 강제 종료 버튼 프레임 및 버튼 추가
+        btn_kill_frame = ttk.Frame(db_sec, style="Panel.TFrame")
+        btn_kill_frame.pack(fill="x", padx=10, pady=(2, 5))
+
+        self.btn_kill_rg = ttk.Button(btn_kill_frame, text="🔫 rg.exe 프로세스 강제 종료(0)", 
+                                 style="Stop.TButton", command=self.kill_rg_processes)
+        self.btn_kill_rg.pack(fill="x", expand=True)
 
         # 1.5구역: 📊 AI 토큰 실시간 모니터링 & 제어 (Bento Panel)
         token_sec = tk.LabelFrame(left_frame, text=" 📊 AI 일일 토큰 제어기 (Double-Click) ", 
@@ -321,8 +539,8 @@ class RAGManagerApp:
         # ==========================================
         # [우측 프레임] RAG 탐색 쉘 및 터미널 로그 (나머지 영역)
         # ==========================================
-        right_frame = ttk.Frame(main_paned, style="TFrame")
-        main_paned.add(right_frame, weight=7)
+        right_frame = ttk.Frame(main_frame, style="TFrame")
+        right_frame.pack(side="left", fill="both", expand=True)
 
         # 상단과 하단을 나누는 내부 PanedWindow
         right_paned = ttk.Panedwindow(right_frame, orient="vertical")
@@ -442,6 +660,34 @@ class RAGManagerApp:
         self.file_watcher_thread.start()
         self.write_console_log("SYSTEM", f"★ [감시자] 비동기 자가 학습 감시 데몬 기동 완료. (감시 파일 절대 경로: {PENDING_FILE})")
 
+    def start_embedded_api_server(self):
+        """RAG DB와 GUI 데이터 결합을 위한 임베디드 백그라운드 API 서버 가동"""
+        if not self.engine:
+            return
+        
+        EmbeddedRAGHandler.engine = self.engine
+        EmbeddedRAGHandler.app_instance = self
+        
+        def run():
+            try:
+                # 127.0.0.1 루프백 포트로 바인딩하여 외부 접근 차단 및 안전 확보
+                server_address = ('127.0.0.1', 8085)
+                self.api_server = HTTPServer(server_address, EmbeddedRAGHandler)
+                self.write_console_log("SYSTEM", "🚀 [임베디드 API] RAG HTTP API 백그라운드 서버 가동 성공 (Port: 8085)")
+                self.api_server.serve_forever()
+            except Exception as e:
+                self.write_console_log("SYSTEM_ERROR", f"임베디드 API 서버 구동 에러: {str(e)}")
+                # 사용자에게 가시성 높은 긴급 오류 고지 팝업창 띄우기
+                self.root.after(0, lambda: messagebox.showerror(
+                    "임베디드 API 서버 오류",
+                    f"RAG DB 백그라운드 API 서버(Port 8085) 가동에 실패했습니다.\n\n"
+                    f"오류 상세: {str(e)}\n\n"
+                    "다른 RAG DB 매니저 인스턴스가 켜져 있거나, 포트 8085를 다른 프로그램이 독점하고 있습니다."
+                ))
+
+        self.api_server_thread = threading.Thread(target=run, daemon=True)
+        self.api_server_thread.start()
+
     def _watch_pending_ingestion(self):
         """1초 주기로 pending_ingestion.json 및 rag_mcp_traffic.log를 검출하여 UI 및 DB 동기화 (디버깅 로그 포함)"""
         traffic_log_path = os.path.join(BASE_DIR, "rag_mcp_traffic.log")
@@ -500,15 +746,15 @@ class RAGManagerApp:
                                                 in_t = int(match.group(2))
                                                 out_t = int(match.group(3))
                                                 
-                                                write_debug(f"💾 [DB 누적] 모델: {model_name} | In: {in_t} | Out: {out_t}")
-                                                # DB에 실시간 누적 합산 적재
-                                                self.engine.record_token_usage(model_name, in_t, out_t)
-                                                write_debug("💾 [DB 누적 완료] 정상 반영 성공")
+                                                write_debug(f"💾 [DB 누적 제거] 데드락 방지를 위해 백그라운드 DB 쓰기 중단: 모델: {model_name}")
+                                                # [데드락 제거] 백그라운드 스레드에서 직접 SQLite DB에 쓰기 연산을 배제하여 MCP 서버와의 락 경합을 원천 차단합니다.
+                                                # self.engine.record_token_usage(model_name, in_t, out_t)
+                                                write_debug("💾 [DB 누적 제거] 로그 모니터에만 출력하도록 우회 완료")
                                             else:
                                                 write_debug("⚠️ [토큰 파싱 실패] 정규식 패턴 불일치")
                                         except Exception as de:
                                             write_debug(f"❌ [DB 누적 에러] {str(de)}")
-                                            self.root.after(0, self.write_console_log, "SYSTEM_ERROR", f"토큰 로그 실시간 DB 적재 실패: {str(de)}")
+                                            self.root.after(0, self.write_console_log, "SYSTEM_ERROR", f"토큰 로그 실시간 DB 적재 생략 (데드락 보호): {str(de)}")
                                     
                                     self.root.after(0, self.refresh_token_usage)
                             except Exception as le:
@@ -530,50 +776,23 @@ class RAGManagerApp:
                                 write_debug(f"❌ [소거 일반 에러] {str(e)}")
                                 break
 
-            # 2. 임시 적재 JSON 파일 감시 (수동/동기화 누락 건 자동 적재)
+            # 2. 임시 적재 JSON 파일 감시 (데드락 방지를 위해 백그라운드 자동 적재 로직 우회 및 스킵)
             if os.path.exists(PENDING_FILE):
                 try:
-                    self.root.after(0, self.write_console_log, "SELF_LEARN", "임시 적재 파일 pending_ingestion.json 검출 완료! 락 안착 대기 가동 (0.5s)...")
+                    self.root.after(0, self.write_console_log, "SELF_LEARN", "임시 적재 파일 pending_ingestion.json 검출 완료! 데드락 방지를 위해 감시 소거만 수행합니다...")
                     time.sleep(0.5) # 파일 쓰기 락 경합 방지용 안착 대기
                     
-                    self.root.after(0, self.write_console_log, "SELF_LEARN", "파일 버퍼 스트림 오픈 시도...")
                     with open(PENDING_FILE, "r", encoding="utf-8") as f:
                         data = json.load(f)
                     
-                    self.root.after(0, self.write_console_log, "SELF_LEARN", f"JSON 파싱 성공! 데이터 규격: {list(data.keys())}")
-                    
-                    # 데이터 필수성 정합성 체크
-                    has_category = "category" in data
-                    has_issue = "issue_summary" in data
-                    has_solution = "solution_code" in data
-                    
-                    if has_category and has_issue and has_solution:
-                        self.root.after(0, self.write_console_log, "SELF_LEARN", "정합성 검증 통과! 로컬 RAG 인덱싱 엔진 마운트 중...")
-                        
-                        new_id = self.engine.add_knowledge(
-                            category=data["category"],
-                            issue_summary=data["issue_summary"],
-                            root_cause=data.get("root_cause", ""),
-                            solution_code=data["solution_code"],
-                            tags=data.get("tags", "")
-                        )
-                        
-                        log_msg = (
-                            f"★실시간 자가 학습 인덱싱 감지 성공! (신규 지식 ID: {new_id})\n"
-                            f"   [분류/카테고리] : {data['category']}\n"
-                            f"   [이슈 요약 현상] : {data['issue_summary']}\n"
-                            f"   [근본 원인 분석] : {data.get('root_cause', '')}\n"
-                            f"   [최적 해결 코드] : {data['solution_code'][:150]}...\n"
-                            f"   [관련 검색 태그] : {data.get('tags', '')}\n"
-                            f"--------------------------------------------------------------------------"
-                        )
-                        self.root.after(0, self.write_console_log, "SELF_LEARN", log_msg)
-                        self.root.after(0, self._check_db_status)
-                        self.root.after(0, self.refresh_knowledge_list)
-                        self.root.after(0, self.refresh_token_usage)
-                    else:
-                        err_details = f"필수 키 누락! (category={has_category}, issue_summary={has_issue}, solution_code={has_solution})"
-                        self.root.after(0, self.write_console_log, "SELF_LEARN_ERR", f"⚠️ 데이터 정합성 실패: {err_details}\n수신 원본 데이터: {json.dumps(data, ensure_ascii=False)}")
+                    # [데드락 제거] 백그라운드 스레드에서 add_knowledge를 호출하여 SQLite DB에 접근하는 로직을 제거하고, MCP 서버가 직접 처리하도록 위임합니다.
+                    log_msg = (
+                        f"⚠️ [데드락 보호] 백그라운드 RAG 자동 지식 주입이 생략되었습니다. (MCP 서버가 단독으로 지식을 처리합니다.)\n"
+                        f"   [분류/카테고리] : {data.get('category', 'General')}\n"
+                        f"   [이슈 요약 현상] : {data.get('issue_summary', '')}\n"
+                        f"--------------------------------------------------------------------------"
+                    )
+                    self.root.after(0, self.write_console_log, "SELF_LEARN", log_msg)
                     
                     self.root.after(0, self.write_console_log, "SELF_LEARN", "임시 적재 파일 pending_ingestion.json 안전 소거 수행...")
                     os.remove(PENDING_FILE)
@@ -862,8 +1081,7 @@ class RAGManagerApp:
         # 근본 원인
         if record.get("root_cause"):
             tk.Label(body_frame, text="▶ 근본 원인 분석", font=("Segoe UI", 10, "bold"), bg=self.color_panel, fg="#f3f4f6").pack(anchor="w", pady=2)
-            lbl_ca
-          use = tk.Message(body_frame, text=record["root_cause"], font=("Segoe UI", 9), bg="#1f2937", fg="#e5e7eb", width=760, relief="flat", bd=0, padx=10, pady=8)
+            lbl_cause = tk.Message(body_frame, text=record["root_cause"], font=("Segoe UI", 9), bg="#1f2937", fg="#e5e7eb", width=760, relief="flat", bd=0, padx=10, pady=8)
             lbl_cause.pack(fill="x", pady=4)
 
         # 최적 해결 코드 블록 (ScrolledText)
@@ -971,9 +1189,102 @@ class RAGManagerApp:
                 self.write_console_log("SYSTEM_ERROR", f"레지스트리 키 삭제 실패: {str(e)}")
                 messagebox.showerror("오류", f"레지스트리 값 해제 중 에러가 발생했습니다: {str(e)}")
 
+    def kill_rg_processes(self, show_msg=True):
+        """백그라운드에서 실행 중인 모든 rg.exe 프로세스를 강제 소거합니다.
+        프로세스가 완전히 사라질 때까지 루프를 통해 반복적으로 강제 종료합니다.
+        """
+        import subprocess
+        import time
+        try:
+            if show_msg:
+                self.write_console_log("SYSTEM", "🔫 백그라운드 rg.exe 프로세스 강제 소거 명령 실행 중...")
+            
+            max_attempts = 15
+            attempt = 0
+            killed_count = 0
+            
+            while attempt < max_attempts:
+                # 1. rg.exe가 여전히 구동 중인지 검사
+                check = subprocess.run('tasklist /FI "IMAGENAME eq rg.exe"', shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors='ignore')
+                
+                # 라인 단위 검사를 통해 실제 구동 중인 rg.exe 확인
+                has_rg = False
+                for line in check.stdout.splitlines():
+                    if line.lower().startswith("rg.exe"):
+                        has_rg = True
+                        break
+                
+                if not has_rg:
+                    break
+                
+                # 2. 강제 종료 수행
+                subprocess.run("taskkill /F /IM rg.exe", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors='ignore')
+                killed_count += 1
+                attempt += 1
+                time.sleep(0.15) # 프로세스가 리소스 해제할 시간 대기
+            
+            if killed_count > 0:
+                self.write_console_log("SYSTEM", f"✅ 모든 rg.exe 프로세스가 완전히 종료되었습니다. (시도: {attempt}회, 처리됨)")
+                if show_msg:
+                    messagebox.showinfo("종료 완료", f"실행 중이던 rg.exe 프로세스를 총 {killed_count}회 반복 강제 종료하여 완전히 제거하였습니다.")
+            else:
+                self.write_console_log("SYSTEM", "⚠️ rg.exe 종료 명령 처리: 현재 실행 중인 rg.exe 프로세스가 없습니다.")
+                if show_msg:
+                    messagebox.showinfo("안내", "실행 중인 rg.exe 프로세스가 없거나 이미 종료되었습니다.")
+            
+            # 즉각적으로 버튼 텍스트 반영
+            self.root.after(0, lambda: self.btn_kill_rg.configure(text="🔫 rg.exe 프로세스 강제 종료(0)"))
+        except Exception as e:
+            self.write_console_log("SYSTEM_ERROR", f"rg.exe 프로세스 강제 종료 실패: {str(e)}")
+            if show_msg:
+                messagebox.showerror("오류", f"프로세스 강제 종료 중 예상치 못한 에러가 발생했습니다:\n{str(e)}")
+
+    def count_rg_processes(self):
+        """현재 윈도우 OS에서 활성화된 rg.exe 프로세스의 개수를 계산합니다.
+        한글 Windows 환경의 CP949 인코딩으로 인한 UnicodeDecodeError를 완벽히 예방합니다.
+        """
+        import subprocess
+        try:
+            check = subprocess.run(
+                'tasklist /FI "IMAGENAME eq rg.exe"', 
+                shell=True, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE, 
+                text=True, 
+                errors='ignore'
+            )
+            
+            # tasklist 출력 라인을 정밀 분석하여 실제 rg.exe 실행 인스턴스 수 계산
+            count = 0
+            for line in check.stdout.splitlines():
+                if line.lower().startswith("rg.exe"):
+                    count += 1
+            return count
+        except Exception as e:
+            if hasattr(self, 'write_console_log'):
+                self.write_console_log("SYSTEM_ERROR", f"rg.exe 카운트 연산 중 예외 발생: {str(e)}")
+            return 0
+
+    def update_rg_count_loop(self):
+        """1분(60초)마다 rg.exe 프로세스 개수를 실시간 감지하여 종료 버튼 텍스트와 UI 스타일에 동적 바인딩합니다."""
+        try:
+            count = self.count_rg_processes()
+            self.btn_kill_rg.configure(text=f"🔫 rg.exe 프로세스 강제 종료({count})")
+        except Exception as e:
+            self.write_console_log("SYSTEM_ERROR", f"rg.exe 프로세스 카운트 업데이트 에러: {str(e)}")
+        finally:
+            # 60000ms(1분) 후에 메인 루프를 방해하지 않고 다시 실행
+            if self.is_watching_files:
+                self.root.after(60000, self.update_rg_count_loop)
+
     def restart_application(self):
         """현재 어플리케이션을 안전하게 셧다운하고 즉시 새 인스턴스로 핫 재시작"""
         self.is_watching_files = False
+        if hasattr(self, 'api_server'):
+            try:
+                self.api_server.shutdown()
+            except Exception:
+                pass
         if self.tray_icon:
             try:
                 self.tray_icon.stop()
@@ -991,6 +1302,11 @@ class RAGManagerApp:
 
     def close_application(self):
         self.is_watching_files = False
+        if hasattr(self, 'api_server'):
+            try:
+                self.api_server.shutdown()
+            except Exception:
+                pass
         if self.tray_icon:
             try:
                 self.tray_icon.stop()
@@ -1003,13 +1319,7 @@ class RAGManagerApp:
         subprocess.run('taskkill /F /FI "WINDOWTITLE eq *Neo\'s Local RAG DB Manager*" /T', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         sys.exit(0)
 
-    def _force_sash_ratio(self):
-        """좌우 레이아웃 창 분할을 3:7 비율로 강제 정렬"""
-        try:
-            # 1180px 기준 30% 영역인 354px로 구분선 강제 이동
-            self.main_paned.sashpos(0, 354)
-        except Exception:
-            pass
+
 
 if __name__ == "__main__":
     _ensure_single_instance()  # 🔒 1순위: 중복 기동 방지를 위한 포트 뮤텍스 락 가동
